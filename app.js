@@ -1,8 +1,6 @@
 'use strict';
 
-const DB_KEY = 'journal_entries';
 const PIN_KEY = 'journal_pin';
-const LOCKED_KEY = 'journal_locked';
 
 let state = {
   entries: [],
@@ -13,28 +11,83 @@ let state = {
   searchQuery: '',
 };
 
-// ── STORAGE ──────────────────────────────────────────────────────────────────
+// ── INDEXEDDB STORAGE ─────────────────────────────────────────────────────────
+
+let db;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('MonJournal', 1);
+    req.onupgradeneeded = e => {
+      const d = e.target.result;
+      if (!d.objectStoreNames.contains('entries')) {
+        d.createObjectStore('entries', { keyPath: 'id' });
+      }
+      if (!d.objectStoreNames.contains('settings')) {
+        d.createObjectStore('settings');
+      }
+    };
+    req.onsuccess = e => { db = e.target.result; resolve(db); };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function txEntries(mode) {
+  return db.transaction('entries', mode).objectStore('entries');
+}
+
+function txSettings(mode) {
+  return db.transaction('settings', mode).objectStore('settings');
+}
 
 function loadEntries() {
-  try { state.entries = JSON.parse(localStorage.getItem(DB_KEY)) || []; }
-  catch { state.entries = []; }
+  return new Promise(resolve => {
+    const req = txEntries('readonly').getAll();
+    req.onsuccess = () => { state.entries = req.result || []; resolve(); };
+    req.onerror = () => { state.entries = []; resolve(); };
+  });
 }
 
-function saveEntries() {
-  localStorage.setItem(DB_KEY, JSON.stringify(state.entries));
+function saveEntry_db(entry) {
+  return new Promise((resolve, reject) => {
+    const req = txEntries('readwrite').put(entry);
+    req.onsuccess = resolve;
+    req.onerror = () => reject(req.error);
+  });
 }
 
-function getPin() { return localStorage.getItem(PIN_KEY); }
-function setPin(p) { localStorage.setItem(PIN_KEY, p); }
+function deleteEntry_db(id) {
+  return new Promise((resolve, reject) => {
+    const req = txEntries('readwrite').delete(id);
+    req.onsuccess = resolve;
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function getPin() {
+  return new Promise(resolve => {
+    const req = txSettings('readonly').get('pin');
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => resolve(null);
+  });
+}
+
+function setPin(p) {
+  return new Promise((resolve, reject) => {
+    const req = txSettings('readwrite').put(p, 'pin');
+    req.onsuccess = resolve;
+    req.onerror = () => reject(req.error);
+  });
+}
 
 // ── PIN / LOCK ────────────────────────────────────────────────────────────────
 
-function showLock() {
+async function showLock() {
   document.getElementById('lock-screen').classList.add('active');
   document.getElementById('app-screen').classList.remove('active');
   state.pinBuffer = '';
   updateDots();
-  const hasPin = !!getPin();
+  const hasPin = !!(await getPin());
   document.getElementById('lock-subtitle').textContent = hasPin
     ? 'Entrez votre code PIN' : 'Créez un code PIN';
   document.getElementById('first-time-hint').style.display = hasPin ? 'none' : 'block';
@@ -61,16 +114,15 @@ function triggerError() {
   setTimeout(updateDots, 600);
 }
 
-function handlePin(num) {
+async function handlePin(num) {
   if (state.pinBuffer.length >= 4) return;
   state.pinBuffer += num;
   updateDots();
   if (state.pinBuffer.length < 4) return;
 
-  const stored = getPin();
+  const stored = await getPin();
 
   if (!stored) {
-    // First time — set PIN
     if (!state.isSettingPin) {
       state.isSettingPin = true;
       state.pendingPin = state.pinBuffer;
@@ -80,7 +132,7 @@ function handlePin(num) {
       updateDots();
     } else {
       if (state.pinBuffer === state.pendingPin) {
-        setPin(state.pinBuffer);
+        await setPin(state.pinBuffer);
         state.isSettingPin = false;
         showApp();
       } else {
@@ -95,7 +147,6 @@ function handlePin(num) {
       }
     }
   } else {
-    // Verify PIN
     if (state.pinBuffer === stored) {
       showApp();
     } else {
@@ -220,6 +271,7 @@ function openEntry(id) {
   document.getElementById('entry-content').value = entry.content || '';
   document.getElementById('date-display').textContent = formatDateFull(entry.createdAt);
   document.getElementById('btn-delete').style.display = 'flex';
+  document.getElementById('btn-export-one').style.display = 'flex';
   showEditView();
 }
 
@@ -229,33 +281,37 @@ function newEntry() {
   document.getElementById('entry-content').value = '';
   document.getElementById('date-display').textContent = formatDateFull(new Date().toISOString());
   document.getElementById('btn-delete').style.display = 'none';
+  document.getElementById('btn-export-one').style.display = 'none';
   showEditView();
   setTimeout(() => document.getElementById('entry-content').focus(), 100);
 }
 
-function saveEntry() {
+async function saveEntry() {
   const title = document.getElementById('entry-title').value.trim();
   const content = document.getElementById('entry-content').value.trim();
   if (!title && !content) return showList();
 
   const now = new Date().toISOString();
+  let entry;
   if (state.currentId) {
     const idx = state.entries.findIndex(e => e.id === state.currentId);
     if (idx >= 0) {
-      state.entries[idx] = { ...state.entries[idx], title, content, updatedAt: now };
+      entry = { ...state.entries[idx], title, content, updatedAt: now };
+      state.entries[idx] = entry;
     }
   } else {
-    state.entries.unshift({ id: Date.now().toString(), title, content, createdAt: now, updatedAt: now });
+    entry = { id: Date.now().toString(), title, content, createdAt: now, updatedAt: now };
+    state.entries.unshift(entry);
   }
-  saveEntries();
+  await saveEntry_db(entry);
   showList();
 }
 
-function deleteEntry() {
+async function deleteEntry() {
   if (!state.currentId) return;
   if (!confirm('Supprimer cette entrée ?')) return;
+  await deleteEntry_db(state.currentId);
   state.entries = state.entries.filter(e => e.id !== state.currentId);
-  saveEntries();
   showList();
 }
 
@@ -277,8 +333,18 @@ function showList() {
 
 // ── INIT ────────────────────────────────────────────────────────────────────
 
-function init() {
-  loadEntries();
+async function init() {
+  // Theme
+  const savedTheme = await getSavedTheme();
+  applyTheme(savedTheme);
+  document.getElementById('btn-theme').addEventListener('click', toggleTheme);
+
+  // Export
+  document.getElementById('btn-export-all').addEventListener('click', exportAll);
+  document.getElementById('btn-export-one').addEventListener('click', exportOne);
+
+  await openDB();
+  await loadEntries();
 
   // Numpad
   document.querySelectorAll('.num-btn[data-num]').forEach(btn => {
@@ -320,3 +386,91 @@ function init() {
 }
 
 document.addEventListener('DOMContentLoaded', init);
+
+// ── THEME ─────────────────────────────────────────────────────────────────────
+
+function getSavedTheme() {
+  return new Promise(resolve => {
+    const req = txSettings('readonly').get('theme');
+    req.onsuccess = () => resolve(req.result || 'dark');
+    req.onerror = () => resolve('dark');
+  });
+}
+
+function saveTheme(theme) {
+  txSettings('readwrite').put(theme, 'theme');
+}
+
+function applyTheme(theme) {
+  document.body.classList.toggle('dark', theme === 'dark');
+  document.body.classList.toggle('light', theme === 'light');
+  document.getElementById('icon-moon').style.display = theme === 'dark' ? 'block' : 'none';
+  document.getElementById('icon-sun').style.display = theme === 'light' ? 'block' : 'none';
+}
+
+function toggleTheme() {
+  const isDark = document.body.classList.contains('dark');
+  const newTheme = isDark ? 'light' : 'dark';
+  applyTheme(newTheme);
+  saveTheme(newTheme);
+}
+
+// ── EXPORT ────────────────────────────────────────────────────────────────────
+
+function downloadText(filename, content) {
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function exportOne() {
+  const entry = state.entries.find(e => e.id === state.currentId);
+  if (!entry) return;
+  const d = new Date(entry.createdAt);
+  const dateStr = d.toLocaleDateString('fr-FR', {year:'numeric', month:'2-digit', day:'2-digit'}).replace(/\//g,'-');
+  const title = (entry.title || 'note').replace(/[^a-zA-Z0-9\u00C0-\u024F _-]/g, '').trim() || 'note';
+  const content = [
+    entry.title ? `# ${entry.title}` : '',
+    `Date : ${formatDateFull(entry.createdAt)}`,
+    '',
+    entry.content || ''
+  ].filter((l, i) => !(i === 0 && !l)).join('\n');
+  downloadText(`journal_${dateStr}_${title}.txt`, content);
+  showToast('Note exportée ✓');
+}
+
+function exportAll() {
+  if (!state.entries.length) { showToast('Aucune note à exporter'); return; }
+  const sorted = [...state.entries].sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
+  const lines = ['MON JOURNAL — Export complet', `Exporté le ${new Date().toLocaleDateString('fr-FR')}`, '═'.repeat(50), ''];
+  sorted.forEach((e, i) => {
+    if (i > 0) lines.push('', '─'.repeat(40), '');
+    if (e.title) lines.push(`# ${e.title}`);
+    lines.push(`Date : ${formatDateFull(e.createdAt)}`);
+    lines.push('');
+    lines.push(e.content || '');
+  });
+  const dateStr = new Date().toLocaleDateString('fr-FR', {year:'numeric', month:'2-digit', day:'2-digit'}).replace(/\//g,'-');
+  downloadText(`journal_complet_${dateStr}.txt`, lines.join('\n'));
+  showToast(`${sorted.length} notes exportées ✓`);
+}
+
+// ── TOAST ─────────────────────────────────────────────────────────────────────
+
+function showToast(msg) {
+  let t = document.getElementById('toast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'toast';
+    t.className = 'toast';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.classList.remove('show'), 2500);
+}
